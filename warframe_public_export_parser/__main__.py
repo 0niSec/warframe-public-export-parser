@@ -107,11 +107,6 @@ async def fetch_and_save(session, url, lang):
         os.makedirs(folder, exist_ok=True)
         filename = f"{folder}/warframe_public_export_endpoints_{lang}.txt"
 
-        # Check if the file already exists
-        if os.path.exists(filename):
-            logging.info(f"File {filename} already exists, skipping download")
-            return
-
         async with session.get(url) as response:
             response.raise_for_status()
             data = await response.read()
@@ -156,10 +151,6 @@ async def fetch_and_save_manifest(session, item, lang):
         new_filename = f"{file_name}_{hash_value}{file_ext}"
 
         file_path = os.path.join(folder, new_filename)
-
-        if os.path.exists(file_path):
-            logging.info(f"File {file_path} already exists, skipping download")
-            return
 
         async with session.get(url) as response:
             response.raise_for_status()
