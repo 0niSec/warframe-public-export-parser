@@ -1,24 +1,44 @@
 import glob
 import json
+from logging.handlers import RotatingFileHandler
 import aiohttp
 import asyncio
 import aiofiles
 import lzma
 import logging
 import os
+from datetime import datetime
+
+date = datetime.today().strftime("%Y-%m-%d")
+log_filename = f"logs/warframe_export_logs_{date}.log"
+
+os.makedirs(os.path.dirname(log_filename), exist_ok=True)
 
 # Define the logging configuration
 logging.basicConfig(
-    filename="warframe_public_export.log",
-    level=logging.INFO,
+    level="INFO",
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        RotatingFileHandler(
+            log_filename,
+            mode="w",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        ),
+    ],
+),
+
+logger = logging.getLogger("warframe_export")
+
 
 # Define the langauges we want to download
 # Language codes defined https://warframe.fandom.com/wiki/Public_Export#Available_Languages
 languages = ["en", "de", "es", "fr", "it", "ja"]
 
 # Characters to remove from JSON
+# * Other characters may exist in the other languages, but I believe these are accented characters specific to that language
 characters_to_sanitize = ["\r", "\n", "\t", "\x00", "\x1f"]
 
 # Define the Public Export URL with the given language
@@ -65,22 +85,37 @@ async def check_and_update_export_files(lang):
 
     files_to_update = []
     for line in new_endpoints:
-        filename, new_hash = line.split("!")
-        existing_file = f"data/{lang}/{filename}"
-        logging.info(f"Checking {existing_file}")
+        filename, new_hash = line.strip().split("!")
+        split_filename, file_ext = os.path.splitext(filename)
+        full_filename = f"{split_filename}_{new_hash}{file_ext}"
 
-        if not os.path.exists(existing_file):
-            files_to_update.append(line)
+        # Check if the line matches the ExportManifest file
+        # We're storing this differently in the base data directory
+        if filename.startswith("ExportManifest"):
+            logging.info("ExportManifest file detected.")
+            existing_file = os.path.join("data", full_filename)
+            matching_files = [
+                f for f in os.listdir("data") if f.startswith("ExportManifest_")
+            ]
+            logging.info(f"Matching files: {matching_files} in data directory")
+        else:
+            logging.info(f"Checking file: {filename}")
+            existing_file = os.path.join("data", lang, full_filename)
+            logging.info(f"Checking file: {existing_file}")
+            matching_files = [
+                f
+                for f in os.listdir(os.path.dirname(existing_file))
+                if f.startswith(split_filename)
+            ]
+            logging.info(
+                f"Matching files: {matching_files} in {os.path.dirname(existing_file)}"
+            )
+
+        if not any(f.endswith(f"_{new_hash}{file_ext}") for f in matching_files):
+            files_to_update.append(line.strip())
             logging.info(f"File {existing_file} not found, adding to update list")
         else:
-            async with aiofiles.open(existing_file, "rb") as f:
-                content = await f.read()
-                if not content.decode("utf-8").strip().endswith(new_hash):
-                    files_to_update.append(line)
-                    logging.info(
-                        f"File {existing_file} needs update, adding to update list"
-                    )
-
+            logging.info(f"File {existing_file} does not need updating. Skipping...")
     return files_to_update
 
 
@@ -144,13 +179,21 @@ async def fetch_and_save_manifest(session, item, lang):
 
     url = f"http://content.warframe.com/PublicExport/Manifest/{item}"
     try:
-        filename, hash_value = item.split("!")
+        filename, hash_value = item.strip().split("!")
         folder = "data" if filename == "ExportManifest.json" else f"data/{lang}"
 
         file_name, file_ext = os.path.splitext(filename)
         new_filename = f"{file_name}_{hash_value}{file_ext}"
 
         file_path = os.path.join(folder, new_filename)
+
+        # Remove existing files with the same base name
+        for existing_file in glob.glob(
+            os.path.join(folder, f"{file_name}_*{file_ext}")
+        ):
+            if existing_file != file_path:
+                os.remove(existing_file)
+                logging.info(f"Removed existing file: {existing_file}")
 
         async with session.get(url) as response:
             response.raise_for_status()
@@ -215,7 +258,7 @@ async def reformat_json_file(file_path):
 
 
 # I created this to extract the logic from the main function and make it more modular
-async def download_and_save_png(session, url, save_path):
+async def download_and_save_png(session, url, save_path, hash_value):
     """
     Downloads an image from a given URL and saves it to a file.
 
@@ -223,6 +266,7 @@ async def download_and_save_png(session, url, save_path):
         session (aiohttp.ClientSession): The aiohttp session to use for making the HTTP request.
         url (str): The URL to fetch the image from.
         save_path (str): The path to save the image file.
+        hash_value (str): The hash value to be used in the filename.
     Raises:
         aiohttp.ClientError: If there is an HTTP error during the request.
         Exception: If there is any other unexpected error.
@@ -232,9 +276,20 @@ async def download_and_save_png(session, url, save_path):
     """
 
     try:
-        # Check if the file already exists
-        if os.path.exists(save_path):
-            logging.info(f"File {save_path} already exists, skipping download")
+        file_name, file_ext = os.path.splitext(os.path.basename(save_path))
+        directory = os.path.dirname(save_path)
+        existing_files = [
+            f
+            for f in os.listdir(directory)
+            if f.startswith(file_name.rsplit("_", 1)[0])
+        ]
+
+        logging.info(f"Existing image files: {existing_files}")
+
+        if any(f.endswith(f"_{hash_value}{file_ext}") for f in existing_files):
+            logging.info(
+                f"Image {save_path} with hash {hash_value} already exists, skipping download"
+            )
             return
 
         async with session.get(url) as response:
@@ -243,6 +298,7 @@ async def download_and_save_png(session, url, save_path):
             async with aiofiles.open(save_path, "wb") as f:
                 await f.write(data)
             logging.info(f"Image saved to {save_path}")
+
     except aiohttp.ClientError as e:
         logging.error(f"HTTP error fetching {url}: {e}")
     except Exception as e:
@@ -295,7 +351,9 @@ async def process_manifest_and_download_pngs(manifest_file_path, base_download_f
 
                 # Download and save the image
                 save_path = os.path.join(folder_structure, new_file_name)
-                tasks.append(download_and_save_png(session, full_url, save_path))
+                tasks.append(
+                    download_and_save_png(session, full_url, save_path, hash_value)
+                )
             await asyncio.gather(*tasks)
     except json.JSONDecodeError as e:
         logging.error(f"JSON decode error: {e}")
@@ -421,11 +479,35 @@ async def get_world_state_data(session):
             # Parse the sanitized data
             parsed_data = json.loads(sanitized_data)
 
-            # Save the parsed data as a json file
+            # Check if there are existing world_state_data files
+            # If there are, check the WorldState from the response and compare to the existing files
+            # If they match, skip saving the file
+            # If they don't match, save the file
+            # If there are no existing files, save the file
             file_path = f"data/world_state_data_{console}.json"
-            async with aiofiles.open(file_path, "w") as f:
-                await f.write(json.dumps(parsed_data, indent=4))
-                logging.info(f"Saved world state data for {console} to {file_path}")
+            if os.path.exists(file_path):
+                async with aiofiles.open(file_path, "r") as f:
+                    existing_data = json.loads(await f.read())
+                    logging.debug(
+                        f"Existing World Seed {console}: {existing_data.get('WorldSeed')}"
+                    )
+                    logging.debug(
+                        f"New World Seed {console}: {parsed_data.get('WorldSeed')}"
+                    )
+                if existing_data.get("WorldSeed") == parsed_data.get("WorldSeed"):
+                    logging.info(
+                        f"World state data for {console} is up to date. Skipping save."
+                    )
+                    continue
+                else:
+                    logging.info(
+                        f"World state data for {console} is out of date. Saving new file with World Seed {parsed_data.get('WorldSeed')}"
+                    )
+                    async with aiofiles.open(file_path, "w") as f:
+                        await f.write(json.dumps(parsed_data, indent=4))
+                        logging.info(
+                            f"Saved world state data for {console} to {file_path}"
+                        )
 
         except aiohttp.ClientError as e:
             logging.error(f"Error fetching world state data: {e}")
